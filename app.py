@@ -9,7 +9,7 @@ from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from config import load_config
-
+from commands import CommandDispatcher
 # ── Logging setup ────────────────────────────────────────────────────────────
 
 os.makedirs("logs", exist_ok=True)
@@ -68,54 +68,68 @@ class HoneypotInterface(paramiko.ServerInterface):
         self.client_ip = client_ip
         self.cfg = cfg
         self.event = threading.Event()
-
+        self.dispatcher = CommandDispatcher()
+    def check_channel_pty_request(self, channel, term, width, height, pixelwidth, pixelheight, modes):
+        return True
+    
     def check_channel_request(self, kind, chanid):
         if kind == "session":
             return paramiko.OPEN_SUCCEEDED
         return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
 
-    def check_auth_password(self, username: str, password: str):
-        """Always reject but log every credential attempt."""
+    def check_channel_shell_request(self, channel):
+        self.event.set()
+        return True
+
+    def check_auth_password(self, username, password):
         timestamp = datetime.utcnow().isoformat()
-
-        # Log to credentials JSON file
-        entry = {
-            "timestamp": timestamp,
-            "ip": self.client_ip,
-            "username": username,
-            "password": password,
-        }
+        entry = {"timestamp": timestamp, "ip": self.client_ip, "username": username, "password": password}
         cred_logger.info(json.dumps(entry))
-
-        # Log to main log
-        logger.warning(
-            f"LOGIN ATTEMPT | IP: {self.client_ip} | user: {username!r} | pass: {password!r}"
-        )
-
-        # Fire email alert in background
-        threading.Thread(
-            target=send_alert,
-            args=(self.cfg, self.client_ip, username, password),
-            daemon=True,
-        ).start()
-
-        # Always deny — but delay to slow brute-force
-        import time; time.sleep(1)
-        return paramiko.AUTH_FAILED
-
-    def check_auth_publickey(self, username, key):
-        return paramiko.AUTH_FAILED
+        logger.warning(f"LOGIN SUCCESS SIMULATED | IP: {self.client_ip} | user: {username!r}")
+        threading.Thread(target=send_alert, args=(self.cfg, self.client_ip, username, password), daemon=True).start()
+        return paramiko.AUTH_SUCCESSFUL
 
     def get_allowed_auths(self, username):
         return "password"
+    def handle_shell(self, chan):
+        chan.send("\r\nWelcome to Ubuntu 22.04.1 LTS (GNU/Linux 5.15.0-generic x86_64)\r\n\r\n")
+        prompt = "root@ubuntu:~# "
+        try:
+            while True:
+                chan.send(prompt)
+                command_buf = ""
+                while not command_buf.endswith("\r"):
+                    char = chan.recv(1024).decode("utf-8", errors="ignore")
+                    if not char:
+                        return
+                    if char in ("\x08", "\x7f"):
+                        if len(command_buf) > 0:
+                            command_buf = command_buf[:-1]
+                            chan.send("\b \b")
+                    else:
+                        chan.send(char)
+                        command_buf += char
 
+                cmd = command_buf.strip()
+                chan.send("\r\n")
+                if cmd:
+                    logger.info(f"COMMAND | IP: {self.client_ip} | CMD: {cmd}")
+                
+                response, should_exit = self.dispatcher.execute(cmd)
 
-# ── Per-client handler ────────────────────────────────────────────────────────
+                if response:
+                    chan.send(response)
+
+                if should_exit:
+                    break
+
+        except Exception as e:
+            logger.error(f"Shell error for {self.client_ip}: {e}")
+        finally:
+            chan.close()
 
 def handle_client(client_sock: socket.socket, client_addr: tuple, host_key, cfg: dict):
     ip = client_addr[0]
-    logger.info(f"New connection from {ip}:{client_addr[1]}")
-
     transport = None
     try:
         transport = paramiko.Transport(client_sock)
@@ -125,21 +139,16 @@ def handle_client(client_sock: socket.socket, client_addr: tuple, host_key, cfg:
         server_iface = HoneypotInterface(ip, cfg)
         transport.start_server(server=server_iface)
 
-        # Keep connection open briefly to harvest more attempts
-        channel = transport.accept(timeout=30)
-        if channel:
-            channel.send(b"Permission denied.\r\n")
-            channel.close()
+        # Wait for the client to authenticate and request a shell
+        chan = transport.accept(60) 
+        if chan:
+            server_iface.handle_shell(chan)
 
-    except (paramiko.SSHException, EOFError, ConnectionResetError) as e:
-        logger.debug(f"SSH error from {ip}: {e}")
     except Exception as e:
-        logger.error(f"Unexpected error from {ip}: {e}")
+        logger.debug(f"Connection error from {ip}: {e}")
     finally:
-        if transport:
-            transport.close()
+        if transport: transport.close()
         client_sock.close()
-        logger.info(f"Connection closed: {ip}")
 
 
 # ── Main server loop ──────────────────────────────────────────────────────────
