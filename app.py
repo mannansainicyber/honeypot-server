@@ -1,7 +1,6 @@
 # ---------- IMPORTS ----------
-from classes.SSH import SSH
-import paramiko, socket , threading
-import os
+from classes.SSH import SSH, handle_shell
+import paramiko, socket , threading, os
 # ----------- NEEDED ----------
 KEY_FILE = "server.key"
 if os.path.exists(KEY_FILE):
@@ -26,6 +25,7 @@ def Handle_Client(client_socket,addresss):
         print("[-] No channel opened.")
         return
     print("Channel C0nnected")
+    handle_shell(channel)
     
 
 def start_server(host="0.0.0.0", port=2222):
@@ -40,7 +40,6 @@ def start_server(host="0.0.0.0", port=2222):
         thread = threading.Thread(target=Handle_Client, args=(client, addr))
         thread.daemon = True
         thread.start()
-
 
 if __name__ == "__main__":
     start_server()
