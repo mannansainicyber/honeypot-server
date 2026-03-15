@@ -1,66 +1,132 @@
 import paramiko
 import time
+import socket
+import threading
+
+banner = (
+    "\r\nWelcome to Ubuntu 24.04.4 LTS (GNU/Linux 6.17.0-19-generic x86_64)\r\n"
+    "\r\n"
+    " * Documentation:  https://help.ubuntu.com\r\n"
+    " * Management:     https://landscape.canonical.com\r\n"
+    " * Support:        https://ubuntu.com/pro\r\n"
+    "\r\n"
+    "Expanded Security Maintenance for Applications is not enabled.\r\n"
+    "\r\n"
+    "22 updates can be applied immediately.\r\n"
+    "To see these additional updates run: apt list --upgradable\r\n"
+    "\r\n"
+    "35 additional security updates can be applied with ESM Apps.\r\n"
+    "Learn more about enabling ESM Apps service at https://ubuntu.com/esm\r\n"
+    "\r\n"
+)
 
 class SSH(paramiko.ServerInterface):
+    def __init__(self):
+        self.event = threading.Event()
+
     def check_channel_request(self, kind, chanid):
-        if kind == "session":
-            return paramiko.OPEN_SUCCEEDED
-        return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+        return paramiko.OPEN_SUCCEEDED if kind == "session" else paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
 
     def check_auth_password(self, username, password):
         with open("auth_attempts.log", "a") as f:
             f.write(f"{time.ctime()} - {username}:{password}\n")
         return paramiko.AUTH_SUCCESSFUL 
 
-    def check_auth_publickey(self, username, key):
-        return paramiko.AUTH_FAILED
-
     def get_allowed_auths(self, username):
         return "password"
 
     def check_channel_shell_request(self, channel):
+        self.event.set()
         return True
 
-    def check_channel_pty_request(self, channel, term, width, height, pixelwidth, pixelheight, modes):
+    def check_channel_pty_request(self, channel, term, width, height, pxwidth, pxheight, modes):
         return True
 
 def handle_shell(channel):
-    channel.send("\r\nUbuntu 22.04.1 LTS\r\n\r\n")
+    channel.send(banner)
+    cwd = "/root"
     
-    buffer = ""
+    filesystem = {
+        "/root": {
+            "config.php": "<?php\n$db_user = 'admin';\n$db_pass = 'P@ssw0rd123';\n?>",
+            "notes.txt": "Review server logs for suspicious IP: 194.26.29.11",
+            ".bash_history": "ls -la\ncat /etc/passwd\nexit"
+        },
+        "/etc": {
+            "passwd": "root:x:0:0:root:/root:/bin/bash\nwww-data:x:33:33:www-data:/var/www:/usr/sbin/nologin",
+            "hostname": "ubuntu-srv-01",
+            "issue": "Ubuntu 24.04.4 LTS"
+        }
+    }
+
     while True:
-        channel.send("root@server:~# ")
+        path_display = "~" if cwd == "/root" else cwd
+        channel.send(f"root@server:{path_display}# ")
         line = ""
         while True:
             char = channel.recv(1)
-            if not char:
-                return
-            
+            if not char: return
             if char == b'\r':
                 channel.send("\r\n")
                 break
-            elif char == b'\x7f':
+            elif char == b'\x7f': # Backspace
                 if len(line) > 0:
                     line = line[:-1]
                     channel.send("\b \b")
+            elif char == b'\x03': # Ctrl+C
+                channel.send("^C\r\n")
+                line = ""
+                break
             else:
                 line += char.decode('utf-8', errors='ignore')
                 channel.send(char)
 
-        with open("commands.log", "a") as f:
-            f.write(f"{time.ctime()} - {line}\n")
+        if not line.strip(): continue
 
-        cmd = line.strip()
+        with open("commands.log", "a") as f:
+            f.write(f"{time.ctime()} - [{cwd}] {line}\n")
+
+        parts = line.strip().split()
+        cmd = parts[0]
+        args = parts[1:]
+
         if cmd == "exit":
+            channel.send("logout\r\n")
             channel.close()
             break
         elif cmd == "ls":
-            channel.send("total 8\r\ndrwxr-xr-x 2 root root 4096 Oct 12 10:00 .\r\ndrwxr-xr-x 2 root root 4096 Oct 12 10:00 ..\r\n-rw-r--r-- 1 root root  156 Oct 12 10:05 config.php\r\n")
+            if cwd in filesystem:
+                channel.send("  ".join(filesystem[cwd].keys()) + "\r\n")
+            else:
+                channel.send("\r\n")
+        elif cmd == "cd":
+            target = args[0] if args else "/root"
+            if target == "..":
+                cwd = "/" if cwd == "/root" else "/root"
+            elif target in filesystem or target == "/":
+                cwd = target
+            else:
+                channel.send(f"-bash: cd: {target}: No such file or directory\r\n")
+        elif cmd == "pwd":
+            channel.send(f"{cwd}\r\n")
+        elif cmd == "cat":
+            if args:
+                filename = args[0]
+                if cwd in filesystem and filename in filesystem[cwd]:
+                    content = filesystem[cwd][filename].replace("\n", "\r\n")
+                    channel.send(f"{content}\r\n")
+                else:
+                    channel.send(f"cat: {filename}: No such file or directory\r\n")
+            else:
+                channel.send("usage: cat [file]\r\n")
         elif cmd == "whoami":
             channel.send("root\r\n")
-        elif cmd == "uname -a":
-            channel.send("Linux server 5.15.0-48-generic #54-Ubuntu SMP Fri Aug 26 13:26:29 UTC 2022 x86_64 x86_64 x86_64 GNU/Linux\r\n")
-        elif cmd == "":
-            pass
+        elif cmd == "uname":
+            if "-a" in args:
+                channel.send("Linux server 6.17.0-19-generic #19-Ubuntu SMP PREEMPT_DYNAMIC x86_64 GNU/Linux\r\n")
+            else:
+                channel.send("Linux\r\n")
+        elif cmd in ["sudo", "apt", "wget", "curl", "python3"]:
+            channel.send(f"-bash: {cmd}: command restricted\r\n")
         else:
             channel.send(f"bash: {cmd}: command not found\r\n")
