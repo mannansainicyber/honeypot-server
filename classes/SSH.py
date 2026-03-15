@@ -1,3 +1,4 @@
+import paramiko
 class SSH(paramiko.ServerInterface):
     def check_channel_request(self, kind, chanid):
         if kind == "session":
