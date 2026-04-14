@@ -17,7 +17,7 @@ def Handle_Client(client_socket,addresss):
     transport = paramiko.Transport(client_socket)
     transport.add_server_key(HOST_KEY)
 
-    server = SSH()
+    server = SSH(addresss)
     transport.start_server(server=server)
 
     channel = transport.accept(timeout=20)
@@ -25,7 +25,7 @@ def Handle_Client(client_socket,addresss):
         print("[-] No channel opened.")
         return
     print("Channel C0nnected")
-    handle_shell(channel)
+    handle_shell(channel, addresss)
     
 
 def start_server(host="0.0.0.0", port=2222):
